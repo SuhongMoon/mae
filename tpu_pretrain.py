@@ -9,36 +9,18 @@
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
 import argparse
-import datetime
-import json
-import numpy as np
 import os
-import time
-from pathlib import Path
-
+import math
 import torch
-import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-
 import timm
-
 assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
-
-import util.misc as misc
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
-
 import models_mae
-
-from engine_pretrain import train_one_epoch
-
 import pytorch_lightning as pl
+import pytorch_lightning.callbacks as pl_cb
 from pytorch_lightning.loggers import WandbLogger
-from torchmetrics import Accuracy
-from util.lr_sched import adjust_learning_rate
- 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -50,13 +32,10 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
-
     parser.add_argument('--input_size', default=224, type=int,
                         help='images input size')
-
     parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='Masking ratio (percentage of removed patches).')
-
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
@@ -64,57 +43,49 @@ def get_args_parser():
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
-
     parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='~/imagenet', type=str,
                         help='dataset path')
-
-    parser.add_argument('--output_dir', default='./output_dir',
-                        help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
-                        help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='',
-                        help='resume from checkpoint')
-
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
+    # distributed training parameters on tpus
+    parser.add_argument("--tpus", default=8, type=int, help='The number of tpus to use')
+
+    # logging / ckpting / resume parameters
+    parser.add_argument('--experiment_name', default=None, type=str, help='Experiment name shown in wandb')
+    parser.add_argument('--project', default='mae-tpus', type=str, help='Experiment project group in wandb')
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume_path', default=None, type=str, help='resume from checkpoint')
+    parser.add_argument('--resume_version', default=None, type=str, help='resume wandb version')    
 
     return parser
 
 class MaskedAutoEncoder(pl.LightningModule):
     def __init__(self, args):
+        super().__init__()
         self.args = args
         self.model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
         print("Model = %s" % str(self.model))
 
-        eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-        
+        world_size = args.tpus
+        eff_batch_size = args.batch_size * args.accum_iter * world_size # The number of tpus
+        self.loader_length = args.total_data // eff_batch_size
+
+        ## Define optimizer / lr_scheduler hyperparameters
         if args.lr is None:  # only base_lr is specified
             args.lr = args.blr * eff_batch_size / 256
 
@@ -124,11 +95,15 @@ class MaskedAutoEncoder(pl.LightningModule):
         print("accumulate grad iterations: %d" % args.accum_iter)
         print("effective batch size: %d" % eff_batch_size)
 
+        self.lr = args.lr
+        self.warmup_epochs = args.warmup_epochs
+        self.total_epochs = args.epochs
         self.accum_iter = args.accum_iter
+
+        # Define mask ratio
         self.mask_ratio = args.mask_ratio
 
-
-    def configrue_optimizers(self):
+    def configure_optimizers(self):
         param_groups = optim_factory.add_weight_decay(self.model, self.args.weight_decay)
         optimizer = torch.optim.AdamW(param_groups, lr=self.args.lr, betas=(0.9, 0.95))
         print(optimizer)
@@ -138,34 +113,45 @@ class MaskedAutoEncoder(pl.LightningModule):
     def forward(self, image):
         return self.model(image)
     
-    def training_step(self, data, _):
+    def training_step(self, data, batch_idx):
         image, _ = data
 
         loss, _, _ = self.model(image, self.mask_ratio)
+
         self.log_dict({'train/loss':loss})
+        self.log_dict({'epoch': self.current_epoch, 'step':self.global_step})
+
+        ## Adjust learning rate
+        if batch_idx % self.accum_iter == 0:
+            self.adjust_learning_rate(batch_idx)
+
         return loss
     
-    def on_before_zero_grad(self, optimizer):
-        
+    def adjust_learning_rate(self, data_iter_step):
+        optimizer = self.optimizers()
+        epoch = self.current_epoch + (data_iter_step / self.loader_length)
 
-
-        
-
-
-
+        if data_iter_step % self.accum_iter:
+            """Decay the learning rate with half-cycle cosine after warmup"""
+            ### Linearly warm up learning rate until epoch < warmup_epochs
+            if epoch < self.warmup_epochs: 
+                lr = self.lr * epoch / self.warmup_epochs 
+            else:
+                lr = self.min_lr + (self.lr - self.min_lr) * 0.5 * \
+                    (1. + math.cos(math.pi * (epoch - self.warmup_epochs) / (self.epochs - self.warmup_epochs)))
+            for param_group in optimizer.param_groups:
+                if "lr_scale" in param_group:
+                    param_group["lr"] = lr * param_group["lr_scale"]
+                else:
+                    param_group["lr"] = lr
+            return lr
 
 def main(args):
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
-    device = torch.device(args.device)
-
     # fix the seed for reproducibility
-    seed = args.seed + misc.get_rank() ## working in tpu?
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    cudnn.benchmark = True
+    pl.seed_everything(args.seed)
 
     # simple augmentation
     transform_train = transforms.Compose([
@@ -176,94 +162,59 @@ def main(args):
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    args.total_data = len(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
+    # Define loader
     data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
+        dataset_train, 
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
     )
     
-    # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    # Define model
+    pl_mae_model = MaskedAutoEncoder(args)
 
-    model.to(device)
-
-    model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
-
-    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
+    # Define wandb logger
+    if not args.resume: ## Fool proof
+        args.resume_version = None
+        args.resume_path = None
     
-    if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
+    wandb_logger = WandbLogger(
+        name=args.experiment_name,
+        project=args.project,
+        log_model=True,
+        version=args.resume_version,
+    )
 
-    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
-    print("actual lr: %.2e" % args.lr)
+    wandb_logger.log_hyperparams(args)
+    wandb_logger.watch(pl_mae_model, log=True)
 
-    print("accumulate grad iterations: %d" % args.accum_iter)
-    print("effective batch size: %d" % eff_batch_size)
+    checkpoint_last_k_callback = pl_cb.ModelCheckpoint(
+        every_n_epochs=1,
+        monitor='step',
+        mode='max',
+        save_top_k=5,
+        filename="{name}_{epoch:03d}",
+        save_last=True
+    )
+    lr_monitor = pl_cb.LearningRateMonitor(logging_interval='step')
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-    
-    # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    print(optimizer)
-    loss_scaler = NativeScaler()
+    pl_trainer = pl.Trainer(
+        callbacks=[checkpoint_last_k_callback, lr_monitor],
+        max_epochs=args.epochs,
+        logger=wandb_logger,
+        precision=16,
+        resume_from_checkpoint=args.resume_path,
+        profiler="simple",
+        track_grad_norm = 2,
+        tpu_cores=args.tpus,
+    )
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            log_writer=log_writer,
-            args=args
-        )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
-
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
-
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-
+    pl_trainer.fit(pl_mae_model, data_loader_train)
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
