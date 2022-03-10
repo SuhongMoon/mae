@@ -9,6 +9,7 @@
 # DeiT: https://github.com/facebookresearch/deit
 # --------------------------------------------------------
 
+from distutils.log import debug
 from functools import partial
 
 import torch
@@ -146,6 +147,36 @@ class MaskedAutoencoderViT(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore
+
+    def forward_debug(self, x, mask_ratio):
+        """
+        x: [N, L, D], sequence
+        """
+        debug_output = {}
+        # embed patches
+        x = self.patch_embed(x)
+        debug_output['patch_embed'] = x
+
+        # add pos embed w/o cls token
+        x = x + self.pos_embed[:, 1:, :]
+        debug_output['pos_embed'] = x
+
+        # masking: length -> length * mask_ratio
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        debug_output['masked_x'] = x
+        
+        # apply Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        debug_output['encoder_out'] = x
+
+        return (x, mask, ids_restore), debug_output
 
     def forward_encoder(self, x, mask_ratio):
         # embed patches
