@@ -120,6 +120,11 @@ class MaskedAutoencoderViT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
         return imgs
 
+    def energy_masking(self, x, mask_ratio):
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio)) # masking sequeneces with mask_ratio
+        pass
+
     def random_masking(self, x, mask_ratio, drop_ratio=0.0):
         """
         Perform per-sample random masking by per-sample shuffling.
@@ -163,7 +168,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         # masking: length -> length * mask_ratio
         x, mask, dropped_mask, ids_restore = self.random_masking(x, mask_ratio, drop_ratio)
-
+ 
         # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
@@ -233,9 +238,11 @@ class MaskedAutoencoderViT(nn.Module):
 
         # Sanity Check
         _, L, _ = pred.shape
+        print(dropped_mask.sum(dim=1))
+        print(dropped_latent.shape[1] - 1)
         assert L == ids_restore.shape[1]
         assert L == dropped_pred.shape[1]
-        assert L == dropped_mask.sum(dim=1) + dropped_latent.shape[1] - 1
+        # assert L == dropped_mask.sum(dim=1) + dropped_latent.shape[1] - 1, "dropped_mask.sum(dim=1) + dropped_latent.shape[1] - 1 != L"
         
         return loss, pred, mask, dropped_loss, dropped_pred, dropped_mask
 
