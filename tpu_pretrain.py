@@ -15,7 +15,7 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import timm
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 import models_mae
 import pytorch_lightning as pl
@@ -56,7 +56,7 @@ def get_args_parser():
     parser.add_argument('--data_path', default='~/imagenet', type=str,
                         help='dataset path')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
