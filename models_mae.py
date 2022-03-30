@@ -37,7 +37,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
@@ -51,7 +51,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -120,14 +120,15 @@ class MaskedAutoencoderViT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
         return imgs
 
-    def random_masking(self, x, mask_ratio):
+    def random_masking(self, x, mask_ratio, drop_ratio=0.0):
         """
         Perform per-sample random masking by per-sample shuffling.
         Per-sample shuffling is done by argsort random noise.
         x: [N, L, D], sequence
         """
         N, L, D = x.shape  # batch, length, dim
-        len_keep = int(L * (1 - mask_ratio))
+        len_keep = int(L * (1 - mask_ratio)) # masking sequeneces with mask_ratio
+        drop_len_keep = int(len_keep * (1 - drop_ratio)) # drop unmasked tokens with drop_ratio
         
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
         
@@ -137,17 +138,23 @@ class MaskedAutoencoderViT(nn.Module):
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
+
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
+
+        dropped_mask = torch.ones_like(mask)
+        dropped_mask[:, :drop_len_keep] = 0
+
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
+        dropped_mask = torch.gather(dropped_mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+        return x_masked, mask, dropped_mask, ids_restore
 
-    def forward_encoder(self, x, mask_ratio):
+    def forward_encoder(self, x, mask_ratio, drop_ratio=0.0):
         # embed patches
         x = self.patch_embed(x)
 
@@ -155,7 +162,7 @@ class MaskedAutoencoderViT(nn.Module):
         x = x + self.pos_embed[:, 1:, :]
 
         # masking: length -> length * mask_ratio
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        x, mask, dropped_mask, ids_restore = self.random_masking(x, mask_ratio, drop_ratio)
 
         # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
@@ -167,7 +174,7 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.norm(x)
 
-        return x, mask, ids_restore
+        return x, mask, dropped_mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
         # embed tokens
@@ -213,11 +220,24 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, imgs, mask_ratio=0.75, drop_ratio=0.0):
+        latent, mask, dropped_mask, ids_restore = self.forward_encoder(imgs, mask_ratio, drop_ratio)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        
+        _, L, _ = latent.shape
+        drop_length_keep = int(L * (1 - drop_ratio))
+        dropped_latent = latent[:, :drop_length_keep+1, :] # cls token is considered
+        dropped_pred = self.forward_decoder(dropped_latent, ids_restore)
+        dropped_loss = self.forward_loss(imgs, dropped_pred, dropped_mask)
+
+        # Sanity Check
+        _, L, _ = pred.shape
+        assert L == ids_restore.shape[1]
+        assert L == dropped_pred.shape[1]
+        assert L == dropped_mask.sum(dim=1) + dropped_latent.shape[1] - 1
+        
+        return loss, pred, mask, dropped_loss, dropped_pred, dropped_mask
 
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
